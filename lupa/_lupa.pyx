@@ -1249,23 +1249,14 @@ cdef class _LuaThread(_LuaObject):
 
     def __next__(self):
         assert self._runtime is not None
-        cdef tuple args = self._arguments
-        if args is not None:
-            self._arguments = None
-        return resume_lua_thread(self, args)
+        return resume_lua_thread(self, None)
 
     def send(self, value):
         """Send a value into the coroutine.  If the value is a tuple,
         send the unpacked elements.
         """
-        if value is not None:
-            if self._arguments is not None:
-                raise TypeError("can't send non-None value to a just-started generator")
-            if not isinstance(value, tuple):
-                value = (value,)
-        elif self._arguments is not None:
-            value = self._arguments
-            self._arguments = None
+        if value is not None and not isinstance(value, tuple):
+            value = (value,)
         return resume_lua_thread(self, <tuple>value)
 
     def __bool__(self):
@@ -1316,6 +1307,14 @@ cdef object resume_lua_thread(_LuaThread thread, tuple args):
     lock_runtime(thread._runtime)
     old_top = lua.lua_gettop(L)
     try:
+        # Take the start arguments while holding the runtime lock, so that
+        # they are passed exactly once, into the resume that starts the
+        # coroutine, even if several threads resume it concurrently.
+        if thread._arguments is not None:
+            if args is not None:
+                raise TypeError("can't send non-None value to a just-started generator")
+            args = thread._arguments
+            thread._arguments = None
         check_lua_stack(L, 1)
         if lua.lua_status(co) == 0 and lua.lua_gettop(co) == 0:
             # already terminated

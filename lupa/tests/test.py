@@ -2086,6 +2086,31 @@ class TestThreading(LupaTestCase):
         ##     image = Image.fromstring('1', (image_size, image_size), result_bytes)
         ##     image.show()
 
+    def test_coroutine_start_arguments_are_passed_once(self):
+        lua = self.lupa.LuaRuntime()
+        counter = lua.eval('''
+            function(...)
+                local received = select("#", ...)
+                while true do
+                    received = received + select("#", coroutine.yield(received))
+                end
+            end
+        ''')
+        coroutines = [counter.coroutine(1, 2, 3) for _ in range(200)]
+        thread_count = 4
+        barrier = threading.Barrier(thread_count)
+        results = []
+
+        def resume():
+            barrier.wait()
+            for coroutine in coroutines:
+                results.append(next(coroutine))
+
+        threads = [threading.Thread(target=resume) for _ in range(thread_count)]
+        self._run_threads(threads)
+        self.assertEqual(len(coroutines) * thread_count, len(results))
+        self.assertEqual({3}, set(results))
+
     def test_lua_gc_deadlock(self):
         # Delete a Lua reference from a thread while the LuaRuntime is running.
         lua = self.lupa.LuaRuntime()
