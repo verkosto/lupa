@@ -2531,13 +2531,10 @@ class TestFastRLock(LupaTestCase):
     FastRLock = None
 
     def setUp(self):
-        for filename in os.listdir(os.path.dirname(os.path.dirname(__file__))):
-            if filename.startswith('lupa_lua'):
-                try:
-                    module_name = "lupa." + filename.partition('.')[0]
-                    self.FastRLock = __import__(module_name, fromlist='FastRLock', level=0).FastRLock
-                except ImportError:
-                    pass
+        for module in lupa.tests.find_lua_modules():
+            if hasattr(module, 'FastRLock'):
+                self.FastRLock = module.FastRLock
+                break
         if self.FastRLock is None:
             self.skipTest("No FastRLock implementation found")
         self.locktype = self.FastRLock
