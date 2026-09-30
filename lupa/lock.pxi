@@ -4,8 +4,23 @@ from cpython cimport pythread
 cdef extern from *:
     """
     typedef unsigned long pythread_t;
+
+    /* Without the GIL, the lock owner is read by threads that do not hold
+       the lock, so it must be accessed atomically. */
+    #ifdef Py_GIL_DISABLED
+    #define __lupa_FREE_THREADED 1
+    #define __lupa_load_owner(p) _Py_atomic_load_ulong_relaxed(p)
+    #define __lupa_store_owner(p, v) _Py_atomic_store_ulong_relaxed(p, v)
+    #else
+    #define __lupa_FREE_THREADED 0
+    #define __lupa_load_owner(p) (*(p))
+    #define __lupa_store_owner(p, v) (*(p) = (v))
+    #endif
     """
     ctypedef unsigned long pythread_t
+    const bint FREE_THREADED "__lupa_FREE_THREADED"
+    pythread_t load_owner "__lupa_load_owner" (pythread_t* owner) noexcept nogil
+    void store_owner "__lupa_store_owner" (pythread_t* owner, pythread_t value) noexcept nogil
 
 
 cdef class FastRLock:
@@ -16,6 +31,9 @@ cdef class FastRLock:
     lock is needed, it acquires the lock and notifies the first thread
     to release it when it's done.  This is all made possible by the
     wonderful GIL.
+
+    Without the GIL (free-threaded CPython), there is nothing that makes
+    the counting safe, so the real lock is always acquired instead.
     """
     cdef pythread.PyThread_type_lock _real_lock
     cdef pythread_t _owner               # ID of thread owning the lock
@@ -41,7 +59,7 @@ cdef class FastRLock:
         return lock_lock(self, pythread.PyThread_get_thread_ident(), blocking)
 
     def release(self):
-        if self._count == 0 or self._owner != pythread.PyThread_get_thread_ident():
+        if not _is_owned_by(self, pythread.PyThread_get_thread_ident()):
             raise RuntimeError("cannot release un-acquired lock")
         unlock_lock(self)
 
@@ -53,18 +71,27 @@ cdef class FastRLock:
 
     def __exit__(self, t, v, tb):
         # self.release()
-        if self._count == 0 or self._owner != pythread.PyThread_get_thread_ident():
+        if not _is_owned_by(self, pythread.PyThread_get_thread_ident()):
             raise RuntimeError("cannot release un-acquired lock")
         unlock_lock(self)
 
     def _is_owned(self):
-        return self._count > 0 and self._owner == pythread.PyThread_get_thread_ident()
+        return _is_owned_by(self, pythread.PyThread_get_thread_ident())
+
+
+cdef inline bint _is_owned_by(FastRLock lock, pythread_t current_thread) noexcept nogil:
+    # Only the owning thread writes the count, so it is safe to read
+    # once the owner is known to be the current thread.
+    return load_owner(&lock._owner) == current_thread and lock._count > 0
 
 
 cdef inline bint lock_lock(FastRLock lock, pythread_t current_thread, bint blocking) noexcept nogil:
     # Note that this function *must* hold the GIL when being called.
     # We just use 'nogil' in the signature to make sure that no Python
     # code execution slips in that might free the GIL
+
+    if FREE_THREADED:
+        return _lock_lock_free_threaded(lock, current_thread, blocking)
 
     if lock._count:
         # locked! - by myself?
@@ -80,6 +107,26 @@ cdef inline bint lock_lock(FastRLock lock, pythread_t current_thread, bint block
     return _acquire_lock(
         lock, current_thread,
         pythread.WAIT_LOCK if blocking else pythread.NOWAIT_LOCK)
+
+cdef bint _lock_lock_free_threaded(FastRLock lock, pythread_t current_thread, bint blocking) noexcept nogil:
+    # Without the GIL, the fast path of counting without locking is racy.
+    # Always take the real lock, and only re-enter it without locking
+    # when this thread already owns it.
+    if load_owner(&lock._owner) == current_thread:
+        lock._count += 1
+        return 1
+    if not pythread.PyThread_acquire_lock(lock._real_lock, pythread.NOWAIT_LOCK):
+        if not blocking:
+            return 0
+        # Detach from the interpreter while waiting, so that a
+        # stop-the-world pause (e.g. the garbage collector) is not
+        # blocked by this thread.
+        with nogil:
+            pythread.PyThread_acquire_lock(lock._real_lock, pythread.WAIT_LOCK)
+    lock._count = 1
+    store_owner(&lock._owner, current_thread)
+    return 1
+
 
 cdef bint _acquire_lock(FastRLock lock, pythread_t current_thread, int wait) noexcept nogil:
     # Note that this function *must* hold the GIL when being called.
@@ -117,6 +164,11 @@ cdef inline void unlock_lock(FastRLock lock) noexcept nogil:
     #assert lock._owner == pythread.PyThread_get_thread_ident()
     #assert lock._count > 0
     lock._count -= 1
+    if FREE_THREADED:
+        if lock._count == 0:
+            store_owner(&lock._owner, 0)
+            pythread.PyThread_release_lock(lock._real_lock)
+        return
     if lock._count == 0:
         if lock._is_locked:
             pythread.PyThread_release_lock(lock._real_lock)

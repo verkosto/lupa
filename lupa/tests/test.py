@@ -3,6 +3,7 @@
 import gc
 import operator
 import os.path
+import queue
 import sys
 import threading
 import time
@@ -2086,6 +2087,72 @@ class TestThreading(LupaTestCase):
         ##     image = Image.fromstring('1', (image_size, image_size), result_bytes)
         ##     image.show()
 
+    def test_shared_runtime_concurrent_calls(self):
+        lua = self.lupa.LuaRuntime()
+        build = lua.eval('''
+            function(n, tag)
+                local t = {}
+                for i = 1, n do t[i] = tag .. i end
+                local sum = 0
+                for i = 1, n do sum = sum + i end
+                return sum, t
+            end
+        ''')
+        barrier = threading.Barrier(8)
+        errors = []
+
+        def call(index):
+            barrier.wait()
+            tag = "t%d-" % index
+            for n in range(100, 400):
+                total, table = build(n, tag)
+                if total != n * (n + 1) // 2 or table[n] != tag + str(n):
+                    errors.append((index, n, total, table[n]))
+                    return
+
+        threads = [threading.Thread(target=call, args=(i,)) for i in range(8)]
+        self._run_threads(threads)
+        self.assertEqual([], errors)
+
+    def test_lua_objects_released_from_other_threads(self):
+        # Objects released while another thread holds the runtime lock
+        # are queued and unreferenced later. None of them may get lost.
+        lua = self.lupa.LuaRuntime()
+        count_refs = lua.eval('''
+            function()
+                local n = 0
+                for k, v in pairs(debug.getregistry()) do
+                    if type(k) == "number" and type(v) == "table" then n = n + 1 end
+                end
+                return n
+            end
+        ''')
+        make_table = lua.eval("function() return {} end")
+        refs_before = count_refs()
+
+        handoff = queue.Queue(maxsize=100)
+        releasers = 4
+
+        def produce():
+            try:
+                for _ in range(10000):
+                    handoff.put(make_table())
+            finally:
+                for _ in range(releasers):
+                    handoff.put(None)
+
+        def release():
+            while handoff.get() is not None:
+                pass  # the table is released here, outside the producer
+
+        threads = [threading.Thread(target=produce)]
+        threads += [threading.Thread(target=release) for _ in range(releasers)]
+        self._run_threads(threads)
+        gc.collect()
+        # Two calls: the first one cleans up the queued references.
+        count_refs()
+        self.assertEqual(refs_before, count_refs())
+
     def test_coroutine_start_arguments_are_passed_once(self):
         lua = self.lupa.LuaRuntime()
         counter = lua.eval('''
@@ -2773,6 +2840,19 @@ class TestFastRLock(LupaTestCase):
         self.assertTrue(lock._is_owned())
         lock.release()
         self.assertFalse(lock._is_owned())
+
+    def test_mutual_exclusion(self):
+        lock = self.locktype()
+        counter = [0]
+        iterations = 20000
+        def f():
+            for _ in range(iterations):
+                with lock:
+                    with lock:
+                        value = counter[0]
+                        counter[0] = value + 1
+        self.Bunch(f, 8).wait_for_finished()
+        self.assertEqual(8 * iterations, counter[0])
 
 
 ################################################################################

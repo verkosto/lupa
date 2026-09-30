@@ -1,6 +1,16 @@
 Lupa change log
 ===============
 
+unreleased
+----------
+
+* Lupa declares that it can run without the GIL in free-threaded CPython builds.
+  The runtime lock always uses a real lock there, and objects that are released
+  from other threads and the start arguments of coroutines are handled safely.
+
+* Concurrent resumes of the same coroutine could start it without its arguments.
+
+
 2.8 (2026-04-15)
 ----------------
 

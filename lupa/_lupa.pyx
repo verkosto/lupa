@@ -1,6 +1,7 @@
 # cython: embedsignature=True
 # cython: binding=True
 # cython: language_level=3
+# cython: freethreading_compatible=True
 
 """
 A fast Python wrapper around Lua and LuaJIT2.
@@ -331,19 +332,27 @@ cdef class LuaRuntime:
 
     @cython.final
     cdef void add_pending_unref(self, int ref) noexcept:
+        # Called from any thread that failed to acquire the runtime lock,
+        # possibly while the lock owner is cleaning up the list.
         pyval: object = ref
-        if self._pending_unrefs is None:
-            self._pending_unrefs = [pyval]
-        else:
-            self._pending_unrefs.append(pyval)
+        with cython.critical_section(self):
+            if self._pending_unrefs is None:
+                self._pending_unrefs = [pyval]
+            else:
+                self._pending_unrefs.append(pyval)
 
     @cython.final
     cdef int clean_up_pending_unrefs(self) except -1:
+        # Unlocked fast path. A reference that is added concurrently
+        # gets cleaned up by the next caller.
         if self._pending_unrefs is None or self._state is NULL:
             return 0
 
-        pending_unrefs = self._pending_unrefs
-        self._pending_unrefs = None
+        with cython.critical_section(self):
+            pending_unrefs = self._pending_unrefs
+            self._pending_unrefs = None
+        if pending_unrefs is None:
+            return 0
 
         cdef int ref
         L = self._state
@@ -1262,16 +1271,20 @@ cdef class _LuaThread(_LuaObject):
     def __bool__(self):
         cdef lua.lua_Debug dummy
         assert self._runtime is not None
-        cdef int status = lua.lua_status(self._co_state)
-        if status == lua.LUA_YIELD:
-            return True
-        if status == 0:
-            # copied from Lua code: check for frames
-            if lua.lua_getstack(self._co_state, 0, &dummy) > 0:
-                return True # currently running
-            elif lua.lua_gettop(self._co_state) > 0:
-                return True # not started yet
-        return False
+        lock_runtime(self._runtime)
+        try:
+            status = lua.lua_status(self._co_state)
+            if status == lua.LUA_YIELD:
+                return True
+            if status == 0:
+                # copied from Lua code: check for frames
+                if lua.lua_getstack(self._co_state, 0, &dummy) > 0:
+                    return True # currently running
+                elif lua.lua_gettop(self._co_state) > 0:
+                    return True # not started yet
+            return False
+        finally:
+            unlock_runtime(self._runtime)
 
 cdef _LuaThread new_lua_thread(LuaRuntime runtime, lua_State* L, int n):
     cdef _LuaThread obj = _LuaThread.__new__(_LuaThread)
